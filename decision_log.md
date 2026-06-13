@@ -8,10 +8,15 @@ made, in chronological order. Each entry is intended to map directly to the
 
 ## 1. Label Quality
 
-**Finding:** 4 entries in `curated_gcp_marks.json` were malformed/missing required
-keys (`mark` or `verified_shape`).
+**Finding:** 4 entries in `gcp_marks.json` (1000 total entries) were
+malformed/missing required keys (`mark` or `verified_shape`).
 
-**Decision:** Dropped these 4 entries from the working dataset. 1000 totalentries minus 4 = 996 valid labels used going forward. 
+**Decision:** Dropped these 4 entries from the working dataset.
+**1000 → 996 valid labels** used going forward.
+
+**Note:** the labels file is named `gcp_marks.json`, not
+`curated_gcp_marks.json` as assumed in the original notebook draft — corrected
+in the EDA notebook's `LABELS_PATH`.
 
 ---
 
@@ -22,19 +27,31 @@ are 4096px wide, at two heights: (4096, 2730) — 639 images, and (4096, 3068) �
 images. No EXIF orientation tags present (all `None`), so no rotation correction
 needed.
 
-**Decision:** Work in native pixel coordinates throughout. The spec's 2048x1365 figure is treated as informational/approximate and not authoritative — likely describes a downscaled reference resolution. Keypoint coordinates from`gcp_marks.json` are assumed to already be in native (4096-wide) pixel
-space, consistent with the values observed (e.g. x up to ~4000). All crop-then-resize transforms will be tracked explicitly so predictions can be mapped back to native coordinates for `predictions.json`.
+**Decision:** Work in native pixel coordinates throughout. The spec's 2048x1365
+figure is treated as informational/approximate and not authoritative — likely
+describes a downscaled reference resolution. Keypoint coordinates from
+`curated_gcp_marks.json` are assumed to already be in native (4096-wide) pixel
+space, consistent with the values observed (e.g. x up to ~4000). All
+crop-then-resize transforms will be tracked explicitly so predictions can be
+mapped back to native coordinates for `predictions.json`.
 
 **Two distinct heights (2730 vs 3068) require no special handling** for crop-based
-training — crop generation only depends on local bounds around each keypoint, not total image dimensions.
+training — crop generation only depends on local bounds around each keypoint, not
+total image dimensions.
+
+**Additional finding:** the two sizes correspond to two distinct aspect ratios —
+1.5 (4096x2730, 639 images) and 1.34 (4096x3068, 357 images) — indicating two
+different camera/drone sources across the surveys. Both are landscape orientation;
+no rotation/transpose handling is needed.
 
 ---
 
 ## 3. Image File Integrity
 
-**Finding:** 0 unreadable/corrupted images out of 996 valid-label entries.
+**Finding:** 0 unreadable/corrupted images out of 992 valid-label entries.
 
-**Decision:** No corruption handling needed. Noted in README as a check performed, not as a mitigation required.
+**Decision:** No corruption handling needed. Noted in README as a check performed,
+not as a mitigation required.
 
 ---
 
@@ -43,7 +60,9 @@ training — crop generation only depends on local bounds around each keypoint, 
 **Finding:** 0 byte-identical duplicate images found via MD5 hashing across all
 valid-label images.
 
-**Decision:** No deduplication step needed. Near-duplicates (different frames of the same physical marker from a flight pass) do exist and are handled via the group-aware split (see #6), not via deduplication.
+**Decision:** No deduplication step needed. Near-duplicates (different frames of
+the same physical marker from a flight pass) do exist and are handled via the
+group-aware split (see #6), not via deduplication.
 
 ---
 
@@ -111,28 +130,55 @@ training sample.
 ## 9. Marker Scale / Crop Size
 
 **Finding:** Visual inspection across candidate crop half-sizes (150 / 300 / 500px)
-performed on sample images across all three shape classes.
+performed on sample images across all three shape classes. The physical markers
+are **small relative to the crop** — typically only tens of pixels across, even
+within a 600-1000px crop window. One sampled marker was barely visible even at
+half_size=500.
 
-**Decision (pending final confirmation):** A crop half-size of ~250-300px (native pixels) appears sufficient to contain the marker with surrounding context for all three shapes. ** Crop will be resized to the model's input resolution (e.g. 224x224); the
-resize scale factor and crop offset will both be tracked to allow inverse-mapping predicted coordinates back to native image space.
+**Decision:** Crop half-size = **300px** (600x600 crop) selected as the working
+crop size — large enough to include surrounding context for shape classification,
+small enough that the marker isn't reduced to a handful of pixels after resize.
+Crop is resized to 224x224 for the model input (resize factor ~0.373x). Both the
+crop offset `(x-300, y-300)` and the resize factor are tracked so predicted
+224x224-space coordinates can be mapped back to native image coordinates for
+`predictions.json`.
 
 ---
 
 ## 10. Edge-Clipping / Crop Padding
 
-**Finding:** *(pending — run edge-proximity check at chosen CROP_HALF to determine
-how many keypoints would produce an out-of-bounds crop window)*
-
-**Decision:** *(pending result)* — if a non-trivial fraction of keypoints are near
-image edges, the crop function will use padding (reflect or constant-fill) rather
-than clamping the crop window, to avoid shifting the marker off-center in the crop
-(which would corrupt the regression target unless labels are also adjusted).
+See entry #11 — resolved.
 
 ---
 
-## Open Items / Next Steps
+## 11. Edge-Clipping / Crop Padding (resolved)
 
-- [ ] Finalize crop half-size based on visual review (#9)
-- [ ] Run edge-clipping check at finalized crop size and update #10
-- [ ] Decide and document test_dataset directory structure assumptions (no labels
-      available — confirm path format matches train_dataset for inference)
+**Finding:** At a crop half-size of 300px (600x600 crop), **211 / 996 (21.2%)**
+of training samples have markers within 300px of at least one image border,
+meaning the crop window extends beyond the source image.
+
+**Verification:** Tested `PIL.Image.crop()` directly on an edge-case sample
+(`x=171.8`, half_size=300 → left=-128.2). PIL's `.crop()` automatically returns a
+600x600 image with the out-of-bounds region filled as a black (zero) box — no
+exception, no size mismatch.
+
+**Decision:**
+- No custom padding logic is required in the dataset class. `img.crop((x-300,
+  y-300, x+300, y+300))` is sufficient and always returns a 600x600 image, with
+  the keypoint label correctly fixed at `(300, 300)` in crop-local coordinates
+  for every sample, including the 211 edge cases.
+- **Augmentation caveat:** if random crop-center jitter is used as an
+  augmentation, jitter magnitude must be bounded per-sample
+  (`max_jitter = min(x, w-x, y, h-y, base_jitter)`) so the marker never falls
+  outside the resulting crop frame. This bound is computed per-sample at dataset
+  construction time, not globally.
+- README will state: "21.2% of training crops contain black zero-padded borders
+  due to marker proximity to the source image edge (confirmed via PIL `.crop()`
+  auto-padding behavior); keypoint labels remain correct in all cases."
+
+---
+
+
+
+EDA phase complete. Proceeding to dataset class / model architecture / training
+pipeline design.
