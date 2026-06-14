@@ -20,9 +20,20 @@ CROP_SIZE = CROP_HALF * 2        # 600
 MODEL_INPUT_SIZE = 224           # resized model input (square)
 RESIZE_SCALE = MODEL_INPUT_SIZE / CROP_SIZE  # ~0.3733
 
+# --- Shape label mapping (DECISION_LOG.md, Open Items) ---
+# Dataset uses "L-Shape"; assignment spec example uses "L-Shaped".
+# We train/predict using the dataset's own strings for consistency with
+# ground truth, and emit them as-is in predictions.json. If the grading
+# script expects "L-Shaped" specifically, see SHAPE_LABEL_OUTPUT_OVERRIDE
+# below (left as a documented assumption, not applied by default).
 SHAPE_CLASSES = ["Cross", "Square", "L-Shape"]
 SHAPE_TO_IDX = {s: i for i, s in enumerate(SHAPE_CLASSES)}
 IDX_TO_SHAPE = {i: s for s, i in SHAPE_TO_IDX.items()}
+
+# Optional output remapping applied only in inference.py if a CLI flag is set.
+SHAPE_LABEL_OUTPUT_OVERRIDE = {
+    "L-Shape": "L-Shaped",
+}
 
 
 def get_crop_box(cx: float, cy: float, crop_half: int = CROP_HALF) -> Tuple[int, int, int, int]:
