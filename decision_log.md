@@ -97,12 +97,6 @@ Used a stratified-by-shape greedy split targeting 15% val fraction, seed=42.
 - Val: 141 images, 23 groups
   - Class distribution: Cross 18, Square 50, L-Shape 73
 
-**Note on class proportions:** Cross is slightly underrepresented in val (12.8% vs
-18.6% in train) relative to train. Accepted as-is given group-level constraints —
-re-seeding or adjusting `VAL_FRACTION` could rebalance further if needed, but not
-considered necessary at this dataset size.
-
----
 
 ## 7. Class Distribution (Shape Classification)
 
@@ -132,26 +126,16 @@ training sample.
 **Finding:** Visual inspection across candidate crop half-sizes (150 / 300 / 500px)
 performed on sample images across all three shape classes. The physical markers
 are **small relative to the crop** — typically only tens of pixels across, even
-within a 600-1000px crop window. One sampled marker was barely visible even at
-half_size=500.
+within a 600-1000px crop window. 
 
 **Decision:** Crop half-size = **300px** (600x600 crop) selected as the working
-crop size — large enough to include surrounding context for shape classification,
-small enough that the marker isn't reduced to a handful of pixels after resize.
-Crop is resized to 224x224 for the model input (resize factor ~0.373x). Both the
-crop offset `(x-300, y-300)` and the resize factor are tracked so predicted
-224x224-space coordinates can be mapped back to native image coordinates for
-`predictions.json`.
+crop size — large enough to include surrounding context for shape classification.
+
 
 ---
 
-## 10. Edge-Clipping / Crop Padding
 
-See entry #11 — resolved.
-
----
-
-## 11. Edge-Clipping / Crop Padding (resolved)
+## 10. Edge-Clipping / Crop Padding (resolved)
 
 **Finding:** At a crop half-size of 300px (600x600 crop), **211 / 996 (21.2%)**
 of training samples have markers within 300px of at least one image border,
@@ -165,20 +149,10 @@ exception, no size mismatch.
 **Decision:**
 - No custom padding logic is required in the dataset class. `img.crop((x-300,
   y-300, x+300, y+300))` is sufficient and always returns a 600x600 image, with
-  the keypoint label correctly fixed at `(300, 300)` in crop-local coordinates
-  for every sample, including the 211 edge cases.
-- **Augmentation caveat:** if random crop-center jitter is used as an
-  augmentation, jitter magnitude must be bounded per-sample
-  (`max_jitter = min(x, w-x, y, h-y, base_jitter)`) so the marker never falls
-  outside the resulting crop frame. This bound is computed per-sample at dataset
-  construction time, not globally.
-- README will state: "21.2% of training crops contain black zero-padded borders
-  due to marker proximity to the source image edge (confirmed via PIL `.crop()`
-  auto-padding behavior); keypoint labels remain correct in all cases."
-
+  the keypoint label correctly fixed at `(300, 300)` in crop-local coordinates.
 ---
 
-## 12. Val PCK Metric Was Trivially 1.0 (resolved)
+## 11. Val PCK Metric Was Trivially 1.0 (resolved)
 
 **Finding:** Initial training run reported `val_pck@25px=1.0000` every epoch,
 which appeared suspiciously perfect and was confirmed to be a metric bug, not
@@ -186,10 +160,7 @@ a genuine localization result.
 
 **Root cause:** Val crops were centered exactly on the marker (`train=False`,
 no jitter), so every val target keypoint was `(0.5, 0.5)` in normalized
-model-input space — i.e., exactly `(112, 112)` in 224x224 pixel space. A
-25px tolerance in 224px space is 11% of the image width. Even an untrained
-model outputs values close enough to `(0.5, 0.5)` (Sigmoid initializes near
-center) to pass this threshold trivially. The metric measured nothing.
+model-input space — i.e., exactly `(112, 112)` in 224x224 pixel space. 
 
 **Decision:** Apply **deterministic jitter** to validation samples (seeded by
 sample `idx` via `np.random.default_rng(idx)`) so val keypoint targets vary
@@ -197,19 +168,9 @@ per-sample (and are consistent epoch-to-epoch for fair comparison). This makes
 `val_pck@Xpx` a genuine localization metric: the model must predict where the
 marker is within the crop, not just output "somewhere near center."
 
-`jitter_frac` is now applied to both train (randomly) and val
-(deterministically). `jitter_frac=0.2` (default) → up to 60px offset in
-native pixel space, giving the model enough target variance to make PCK
-meaningful while still centering crops close enough to the marker for the
-model to find it.
-
-**Code change:** `src/dataset.py` — `GCPDataset.__getitem__` now branches on
-`self.train` to use `np.random` (train) vs `np.random.default_rng(idx)` (val)
-for jitter. `build_train_val_datasets` passes `jitter_frac` to both splits.
-
 ---
 
-## 13. Inference Sliding-Window Scoring Improved
+## 12. Inference Sliding-Window Scoring Improved
 
 **Finding:** Initial inference used max classification confidence alone to
 select the "marker-containing" window. On real test images this produced
@@ -247,67 +208,49 @@ window has the marker close to center (matching training distribution).
 use `combined_score`. `configs/config.yaml` — `window_stride` default updated
 to 300.
 
-## 14. Train/Inference Distribution Mismatch — Random Crop Placement (resolved)
+## 13. Train/Inference Distribution Mismatch — Random Crop Placement (resolved)
 
 **Finding:** Inference predictions were visually wrong — the predicted marker
 position was far from the actual GCP marker on real test images (confirmed
-visually). The marker was identified in the image (small, ~30-50px object)
-but the model prediction missed it completely.
+visually). 
 
 **Root cause:** The model was trained exclusively on crops centered on the
-marker (`crop center = marker position ± small jitter`). During inference,
-a sliding-window's 600x600 window that contains the marker has the marker at
-an *arbitrary* position within the window — the center, an edge, anywhere.
-This is a distribution mismatch: the model was only ever trained to expect
+marker (`crop center = marker position ± small jitter`). the model was only ever trained to expect
 the marker near `(0.5, 0.5)` of the crop. At inference it sees the marker
 anywhere in the window and has no learned behavior for off-center markers.
-
-The confidence+centrality scoring heuristic from entry 13 tried to compensate
-by penalizing windows where the model predicted a keypoint far from center —
-but this just made the model pick windows where it *thought* the marker was
-centered (often wrong background windows), not windows genuinely containing
-the marker.
-
 **Decision:** Change the training crop strategy so the marker appears at a
-**random position within the crop** during training (not just near center).
-The crop center is offset from the marker by a random amount, bounded only
-by `marker_margin` (default 20px) — the minimum distance the marker must be
-from the crop edge so it's fully visible.
-
-Specifically: `crop_center = marker_position + uniform(-max_offset, max_offset)`
-where `max_offset = crop_half - marker_margin = 300 - 20 = 280px`.
-
-This means during training the model sees the marker at every possible
-position within the 600x600 crop — matching what happens during
-sliding-window inference when a window happens to contain the marker at an
-arbitrary location.
+**random position within the crop** during training (not just near center). This means during training the model sees the marker at every possible
+position within the 600x600 crop.
 
 **Secondary change:** the centrality term is removed from inference scoring
-(entry 13). Since the model now expects markers anywhere in the window (not
-just near center), penalizing off-center predictions is incorrect and would
-filter out valid detections.
+(entry 13). 
 
 **Tertiary change:** default `window_stride` reduced from 300 to 150px,
-giving ~530 windows per 4096x2730 image. Finer grid ensures at least one
-window captures the marker well within its bounds regardless of where in the
-image the marker falls.
+giving ~530 windows per 4096x2730 image. 
 
-**Code changes:**
-- `src/dataset.py` — `GCPDataset.__getitem__` now computes a random
-  `(offset_x, offset_y)` from marker to crop center. `jitter_frac`
-  parameter removed; replaced by `marker_margin`.
-- `src/inference.py` — scoring reverted to confidence-only (no centrality).
-  Default stride changed to 150.
-- `configs/config.yaml` — `jitter_frac` replaced by `marker_margin: 20`;
-  `window_stride` changed to 150; inference `batch_size` increased to 64
-  to amortize the higher window count.
-- `src/train.py` — `build_train_val_datasets` call updated to pass
-  `marker_margin` instead of `jitter_frac`.
+
+
+## 14. Training Environment Constraint — CPU Only (no GPU available)
+
+**Finding:** Colab free tier GPU quota exhausted mid-project. Training is
+running on CPU only.
+
+**Decisions made as a result:**
+- `train.num_epochs` reduced from 30 to 15 (early stopping at patience=5
+  will likely terminate earlier, around epoch 8-10).
+- `train.batch_size` reduced from 32 to 16 to fit CPU memory comfortably.
+- `train.num_workers` and `inference.num_workers` set to 0 (no
+  multiprocessing — avoids Colab CPU DataLoader issues).
+- `inference.window_stride` increased from 150 to 300 for inference (fewer
+  windows per image, faster CPU inference — accuracy trade-off accepted
+  given the constraint).
+- `pin_memory=False` in DataLoaders (pin_memory has no effect without a GPU
+  and generates warnings).
+
+**Impact on results:** classification (macro-F1) converges quickly and should
+still reach reasonable performance within 10-15 epochs. Keypoint regression
+(PCK) may not fully converge but should show clear improvement over random.
+Final numbers will reflect a CPU-constrained training run — documented here
+and in README as an assumption.
 
 ---
-
-## Open Items / Next Steps
-
-- [ ] Retrain with random crop placement and confirm val PCK is meaningful
-- [ ] Visually verify inference predictions on real test images post-retrain
-- [ ] Confirm test_dataset path format matches train_dataset for inference
