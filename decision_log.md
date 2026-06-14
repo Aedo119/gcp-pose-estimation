@@ -178,7 +178,84 @@ exception, no size mismatch.
 
 ---
 
+## 12. Val PCK Metric Was Trivially 1.0 (resolved)
 
+**Finding:** Initial training run reported `val_pck@25px=1.0000` every epoch,
+which appeared suspiciously perfect and was confirmed to be a metric bug, not
+a genuine localization result.
 
-EDA phase complete. Proceeding to dataset class / model architecture / training
-pipeline design.
+**Root cause:** Val crops were centered exactly on the marker (`train=False`,
+no jitter), so every val target keypoint was `(0.5, 0.5)` in normalized
+model-input space — i.e., exactly `(112, 112)` in 224x224 pixel space. A
+25px tolerance in 224px space is 11% of the image width. Even an untrained
+model outputs values close enough to `(0.5, 0.5)` (Sigmoid initializes near
+center) to pass this threshold trivially. The metric measured nothing.
+
+**Decision:** Apply **deterministic jitter** to validation samples (seeded by
+sample `idx` via `np.random.default_rng(idx)`) so val keypoint targets vary
+per-sample (and are consistent epoch-to-epoch for fair comparison). This makes
+`val_pck@Xpx` a genuine localization metric: the model must predict where the
+marker is within the crop, not just output "somewhere near center."
+
+`jitter_frac` is now applied to both train (randomly) and val
+(deterministically). `jitter_frac=0.2` (default) → up to 60px offset in
+native pixel space, giving the model enough target variance to make PCK
+meaningful while still centering crops close enough to the marker for the
+model to find it.
+
+**Code change:** `src/dataset.py` — `GCPDataset.__getitem__` now branches on
+`self.train` to use `np.random` (train) vs `np.random.default_rng(idx)` (val)
+for jitter. `build_train_val_datasets` passes `jitter_frac` to both splits.
+
+---
+
+## 13. Inference Sliding-Window Scoring Improved
+
+**Finding:** Initial inference used max classification confidence alone to
+select the "marker-containing" window. On real test images this produced
+poor localization — background windows that happened to look like one of the
+three classes were selected over windows genuinely containing the marker.
+
+**Root cause:** The model was trained exclusively on marker-centered crops,
+so it expects the marker near `(0.5, 0.5)` of the crop. A window containing
+the marker near its center will therefore predict both (a) high classification
+confidence AND (b) a keypoint near `(0.5, 0.5)`. A background window may
+achieve (a) but will predict a keypoint far from center (the model "points
+toward" the nearest marker-like feature, which in a background window may be
+at an arbitrary location).
+
+**Decision:** Score each window by the product of classification confidence
+and keypoint centrality:
+
+```
+centrality = 1.0 - clamp(||pred_kp - 0.5||, 0, 1)
+score = confidence * centrality
+```
+
+The highest-scoring window per image is selected. This penalizes windows that
+are confident about shape but predict a marker far from the window center —
+consistent with the training distribution.
+
+**Additionally:** default `window_stride` changed from 600 (non-overlapping)
+to 300 (50% overlap). Non-overlapping windows at stride=600 give only ~35
+windows per 4096x2730 image; with exactly one containing the marker, the
+chance of that window having the marker near its center is low. 50% overlap
+gives ~140 windows, greatly increasing the probability that at least one
+window has the marker close to center (matching training distribution).
+
+**Code change:** `src/inference.py` — scoring loop updated to compute and
+use `combined_score`. `configs/config.yaml` — `window_stride` default updated
+to 300.
+
+---
+
+## Open Items / Next Steps
+
+- [ ] Run full training with updated dataset.py and confirm val PCK is now
+      meaningful (non-trivial, < 1.0 and improving over epochs).
+- [ ] Visually verify inference predictions on real test images.
+- [ ] Confirm test_dataset directory structure matches train_dataset path
+      format (inference `find_test_images` assumes same nested layout).
+
+Training and inference pipeline complete. Outstanding items are validation
+of real-data results.

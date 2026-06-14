@@ -1,6 +1,5 @@
 # Configuration for GCP Pose Estimation training and inference.
-# Paths below are Colab defaults (Google Drive mount) — override as needed
-# for local runs.
+# Paths are Colab defaults — patch in-notebook via Cell 3 before running.
 
 data:
   data_root: "/content/drive/MyDrive/GCP_Assignment_Datasets/train_dataset"
@@ -10,7 +9,7 @@ data:
   split_seed: 42
 
 model:
-  backbone: "resnet18"     # one of: resnet18, resnet34, resnet50
+  backbone: "resnet18"      # resnet18 | resnet34 | resnet50
   pretrained: true
   num_shape_classes: 3
   head_hidden_dim: 128
@@ -21,31 +20,25 @@ train:
   num_epochs: 30
   lr: 1.0e-4
   weight_decay: 1.0e-4
-  jitter_frac: 0.1          # crop-center jitter as fraction of CROP_HALF (see DECISION_LOG entry 11)
-  kp_loss_weight: 5.0        # relative weight of keypoint regression loss vs classification loss
-  use_class_weights: true    # inverse-frequency class weighting for classification loss (DECISION_LOG entry 7)
+  # jitter_frac applied to BOTH train (randomly) and val (deterministically)
+  # so val PCK is a meaningful localization metric (DECISION_LOG entry 12).
+  jitter_frac: 0.2
+  kp_loss_weight: 5.0
+  use_class_weights: true
   num_workers: 2
-  early_stopping_patience: 7 # epochs with no val-loss improvement before stopping
-  checkpoint_dir: "/content/drive/MyDrive/GCP_Assignment_Datasets/checkpoints"
+  early_stopping_patience: 7
+  checkpoint_dir: "/content/checkpoints"
   log_every_n_steps: 20
 
 inference:
-  checkpoint_path: "/content/drive/MyDrive/GCP_Assignment_Datasets/checkpoints/best_model.pt"
-  output_path: "predictions.json"
+  checkpoint_path: "/content/checkpoints/best_model.pt"
+  output_path: "/content/predictions.json"
   batch_size: 32
   num_workers: 2
-  # Sliding-window stride (native pixels). Default = CROP_SIZE (600) for
-  # non-overlapping windows (fastest). Reduce (e.g. 300) for overlapping
-  # windows / higher accuracy at higher compute cost. See src/inference.py
-  # module docstring for rationale.
-  window_stride: 600
-  # If true, remaps "L-Shape" -> "L-Shaped" in predictions.json output to
-  # match the assignment spec's example label string (DECISION_LOG.md,
-  # Open Items). Leave false to keep predictions consistent with the
-  # dataset's own training label strings.
+  # Sliding-window stride in native pixels.
+  # 300 = 50% overlap (recommended, more accurate).
+  # 600 = non-overlapping (faster, less accurate).
+  window_stride: 300
+  # Remap "L-Shape" -> "L-Shaped" to match assignment spec example string.
+  # Leave false to stay consistent with dataset label strings.
   remap_lshape_to_lshaped: false
-
-# Geometry / preprocessing constants are defined in src/utils.py:
-#   CROP_HALF = 300, MODEL_INPUT_SIZE = 224
-# Change there if you need to experiment with crop size (see DECISION_LOG
-# entry 9 for rationale on the chosen values).
