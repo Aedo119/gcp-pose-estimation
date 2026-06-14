@@ -247,15 +247,67 @@ window has the marker close to center (matching training distribution).
 use `combined_score`. `configs/config.yaml` — `window_stride` default updated
 to 300.
 
+## 14. Train/Inference Distribution Mismatch — Random Crop Placement (resolved)
+
+**Finding:** Inference predictions were visually wrong — the predicted marker
+position was far from the actual GCP marker on real test images (confirmed
+visually). The marker was identified in the image (small, ~30-50px object)
+but the model prediction missed it completely.
+
+**Root cause:** The model was trained exclusively on crops centered on the
+marker (`crop center = marker position ± small jitter`). During inference,
+a sliding-window's 600x600 window that contains the marker has the marker at
+an *arbitrary* position within the window — the center, an edge, anywhere.
+This is a distribution mismatch: the model was only ever trained to expect
+the marker near `(0.5, 0.5)` of the crop. At inference it sees the marker
+anywhere in the window and has no learned behavior for off-center markers.
+
+The confidence+centrality scoring heuristic from entry 13 tried to compensate
+by penalizing windows where the model predicted a keypoint far from center —
+but this just made the model pick windows where it *thought* the marker was
+centered (often wrong background windows), not windows genuinely containing
+the marker.
+
+**Decision:** Change the training crop strategy so the marker appears at a
+**random position within the crop** during training (not just near center).
+The crop center is offset from the marker by a random amount, bounded only
+by `marker_margin` (default 20px) — the minimum distance the marker must be
+from the crop edge so it's fully visible.
+
+Specifically: `crop_center = marker_position + uniform(-max_offset, max_offset)`
+where `max_offset = crop_half - marker_margin = 300 - 20 = 280px`.
+
+This means during training the model sees the marker at every possible
+position within the 600x600 crop — matching what happens during
+sliding-window inference when a window happens to contain the marker at an
+arbitrary location.
+
+**Secondary change:** the centrality term is removed from inference scoring
+(entry 13). Since the model now expects markers anywhere in the window (not
+just near center), penalizing off-center predictions is incorrect and would
+filter out valid detections.
+
+**Tertiary change:** default `window_stride` reduced from 300 to 150px,
+giving ~530 windows per 4096x2730 image. Finer grid ensures at least one
+window captures the marker well within its bounds regardless of where in the
+image the marker falls.
+
+**Code changes:**
+- `src/dataset.py` — `GCPDataset.__getitem__` now computes a random
+  `(offset_x, offset_y)` from marker to crop center. `jitter_frac`
+  parameter removed; replaced by `marker_margin`.
+- `src/inference.py` — scoring reverted to confidence-only (no centrality).
+  Default stride changed to 150.
+- `configs/config.yaml` — `jitter_frac` replaced by `marker_margin: 20`;
+  `window_stride` changed to 150; inference `batch_size` increased to 64
+  to amortize the higher window count.
+- `src/train.py` — `build_train_val_datasets` call updated to pass
+  `marker_margin` instead of `jitter_frac`.
+
 ---
 
 ## Open Items / Next Steps
 
-- [ ] Run full training with updated dataset.py and confirm val PCK is now
-      meaningful (non-trivial, < 1.0 and improving over epochs).
-- [ ] Visually verify inference predictions on real test images.
-- [ ] Confirm test_dataset directory structure matches train_dataset path
-      format (inference `find_test_images` assumes same nested layout).
-
-Training and inference pipeline complete. Outstanding items are validation
-of real-data results.
+- [ ] Retrain with random crop placement and confirm val PCK is meaningful
+- [ ] Visually verify inference predictions on real test images post-retrain
+- [ ] Confirm test_dataset path format matches train_dataset for inference

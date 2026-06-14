@@ -5,13 +5,15 @@ shape classification.
 
 Implements the decisions from DECISION_LOG.md:
   - Crop half-size = 300px (600x600), resized to 224x224 (entry 9)
-  - PIL Image.crop() auto-pads out-of-bounds boxes with black (entry 11);
-    no custom padding logic needed.
-  - Train: random crop-center jitter with per-sample bounds (entry 11).
-  - Val: deterministic per-sample jitter (seeded by idx) so val keypoint
-    targets are NOT always (0.5, 0.5) — makes val PCK a meaningful
-    localization metric (entry 12).
-  - Targets are normalized to [0, 1] in model-input space (utils.normalize_target).
+  - PIL Image.crop() auto-pads out-of-bounds boxes with black (entry 11)
+  - Train: crop center is randomly offset from the marker position so the
+    marker can appear ANYWHERE in the crop, not just near center. This
+    matches the inference distribution (sliding window), where a window
+    containing a marker has the marker at an arbitrary position within the
+    window (entry 14).
+  - Val: same random placement but deterministic per sample (seeded by idx)
+    so val PCK is a meaningful localization metric (entry 12).
+  - Targets are normalized to [0, 1] in model-input space.
 """
 
 import json
@@ -26,7 +28,6 @@ import torchvision.transforms as T
 
 from .utils import (
     CROP_HALF,
-    CROP_SIZE,
     MODEL_INPUT_SIZE,
     SHAPE_TO_IDX,
     get_crop_box,
@@ -56,18 +57,16 @@ def load_clean_labels(labels_path: str) -> Dict[str, dict]:
 
 class GCPDataset(Dataset):
     """
-    Each sample is a crop centered near a GCP marker, with:
-      - image: 3x224x224 float tensor, ImageNet-normalized
-      - keypoint: 2-vector, normalized to [0, 1] in model-input space
-      - shape_label: int class index (0=Cross, 1=Square, 2=L-Shape)
-      - meta: dict with original path + crop box for coordinate inverse-transform
+    Each sample is a crop with the GCP marker at a RANDOM position within
+    the crop (not necessarily centered). This matches the sliding-window
+    inference distribution where a window containing a marker has the marker
+    at an arbitrary location within the window (DECISION_LOG entry 14).
 
-    Jitter behaviour:
-      - train=True:  random jitter each call (data augmentation)
-      - train=False: deterministic jitter seeded by sample idx so val targets
-                     vary per-sample and val PCK measures real localization
-                     error rather than trivially returning 1.0 (DECISION_LOG
-                     entry 12).
+    Returns:
+        image:       3 x MODEL_INPUT_SIZE x MODEL_INPUT_SIZE float tensor
+        keypoint:    2-vector [norm_x, norm_y] in [0, 1]
+        shape_label: int class index (0=Cross, 1=Square, 2=L-Shape)
+        meta:        dict with path + crop box for coordinate back-transform
     """
 
     def __init__(
@@ -78,21 +77,21 @@ class GCPDataset(Dataset):
         train: bool = True,
         crop_half: int = CROP_HALF,
         model_input_size: int = MODEL_INPUT_SIZE,
-        jitter_frac: float = 0.1,
+        marker_margin: int = 20,
     ):
         """
         Args:
-            data_root: root directory containing the nested image folders.
-            labels: cleaned labels dict (output of load_clean_labels).
-            paths: list of image paths (subset of labels.keys()) for this split.
-            train: if True applies random jitter + photometric augmentation;
-                   if False applies deterministic jitter (seeded by idx) with
-                   no photometric augmentation.
-            crop_half: half-width of the native-resolution crop window.
+            data_root:        root directory of the dataset.
+            labels:           cleaned labels dict from load_clean_labels.
+            paths:            image paths for this split.
+            train:            if True, random crop placement each call;
+                              if False, deterministic per sample (seeded by idx).
+            crop_half:        half-width of the native crop window (px).
             model_input_size: size to resize the crop to for the model.
-            jitter_frac: max jitter as a fraction of crop_half. Applied to
-                   both train (randomly) and val (deterministically).
-                   Set to 0.0 to disable completely.
+            marker_margin:    minimum distance (px in crop space) the marker
+                              must be from the crop edge. Prevents the marker
+                              from being cropped out during random placement.
+                              Default 20px keeps the marker clearly visible.
         """
         self.data_root = data_root
         self.labels = labels
@@ -100,63 +99,72 @@ class GCPDataset(Dataset):
         self.train = train
         self.crop_half = crop_half
         self.model_input_size = model_input_size
-        self.jitter_frac = jitter_frac
+        self.marker_margin = marker_margin
+
+        # Max offset of crop center from marker so marker stays >= margin
+        # pixels from crop edge
+        self.max_offset = crop_half - marker_margin
 
         self._normalize = T.Normalize(
             mean=[0.485, 0.456, 0.406],
             std=[0.229, 0.224, 0.225],
         )
-
         self._photometric = T.ColorJitter(
-            brightness=0.2, contrast=0.2, saturation=0.2, hue=0.02
+            brightness=0.3, contrast=0.3, saturation=0.3, hue=0.05
         ) if train else None
 
     def __len__(self) -> int:
         return len(self.paths)
 
-    def _max_jitter(self, cx: float, cy: float, w: int, h: int) -> float:
-        """Max jitter (px) keeping the marker inside [0, crop_size).
+    def _get_offset(self, idx: int, x: float, y: float, w: int, h: int):
+        """Return (offset_x, offset_y) to add to the marker position to get
+        the crop center. The offset is bounded so:
+          1. The marker stays >= marker_margin px from the crop edge.
+          2. The crop center stays within the image (no excessive OOB padding).
 
-        Bounded by both jitter_frac * crop_half AND the marker's distance
-        to the nearest image edge (DECISION_LOG.md entry 11).
+        Train: random offset each call.
+        Val:   deterministic offset seeded by idx (same every epoch).
         """
-        base = self.jitter_frac * self.crop_half
-        margin = min(cx, cy, w - cx, h - cy)
-        return float(min(base, max(0.0, margin)))
+        # Bound by marker_margin constraint
+        max_ox = self.max_offset
+        max_oy = self.max_offset
+
+        # Further bound by image edges so we don't create huge black regions
+        # (keep crop center within the image)
+        max_ox = min(max_ox, x, w - x)
+        max_oy = min(max_oy, y, h - y)
+        max_ox = max(0.0, float(max_ox))
+        max_oy = max(0.0, float(max_oy))
+
+        if self.train:
+            ox = np.random.uniform(-max_ox, max_ox)
+            oy = np.random.uniform(-max_oy, max_oy)
+        else:
+            rng = np.random.default_rng(idx)
+            ox = rng.uniform(-max_ox, max_ox)
+            oy = rng.uniform(-max_oy, max_oy)
+
+        return ox, oy
 
     def __getitem__(self, idx: int):
         path = self.paths[idx]
         data = self.labels[path]
-        mark = data["mark"]
-        x, y = float(mark["x"]), float(mark["y"])
+        x, y = float(data["mark"]["x"]), float(data["mark"]["y"])
         shape_label = SHAPE_TO_IDX[data["verified_shape"]]
 
         full_path = os.path.join(self.data_root, path)
         img = Image.open(full_path).convert("RGB")
         w, h = img.size
 
-        cx, cy = x, y
-        if self.jitter_frac > 0:
-            max_j = self._max_jitter(x, y, w, h)
-            if max_j > 0:
-                if self.train:
-                    # Random jitter for augmentation
-                    jx = np.random.uniform(-max_j, max_j)
-                    jy = np.random.uniform(-max_j, max_j)
-                else:
-                    # Deterministic jitter for val: seeded by sample idx so
-                    # the same offset is used every epoch (reproducible) but
-                    # varies across samples (non-trivial PCK target).
-                    rng = np.random.default_rng(idx)
-                    jx = rng.uniform(-max_j, max_j)
-                    jy = rng.uniform(-max_j, max_j)
-                cx, cy = x + jx, y + jy
+        # Randomly offset the crop center from the marker (entry 14)
+        ox, oy = self._get_offset(idx, x, y, w, h)
+        cx, cy = x + ox, y + oy
 
         left, top, right, bottom = get_crop_box(cx, cy, self.crop_half)
         crop = img.crop((left, top, right, bottom))  # PIL auto-pads OOB
 
+        # Marker position within crop, then in model-input space
         crop_x, crop_y = native_to_crop(x, y, left, top)
-
         crop = crop.resize((self.model_input_size, self.model_input_size), Image.BILINEAR)
         resize_scale = self.model_input_size / (2 * self.crop_half)
         model_x, model_y = crop_to_model(crop_x, crop_y, resize_scale)
@@ -185,27 +193,31 @@ def build_train_val_datasets(
     labels_path: str,
     val_fraction: float = 0.15,
     seed: int = 42,
-    jitter_frac: float = 0.1,
+    marker_margin: int = 20,
 ) -> Tuple[GCPDataset, GCPDataset]:
-    """Load labels, perform group-aware split, return (train_ds, val_ds).
-
-    Both train and val use jitter_frac — train randomly, val deterministically
-    (see GCPDataset docstring and DECISION_LOG.md entry 12).
-    """
+    """Load labels, perform group-aware split, return (train_ds, val_ds)."""
     from .splits import group_aware_split
 
     labels = load_clean_labels(labels_path)
-    train_paths, val_paths = group_aware_split(labels, val_fraction=val_fraction, seed=seed)
+    train_paths, val_paths = group_aware_split(
+        labels, val_fraction=val_fraction, seed=seed
+    )
 
-    train_ds = GCPDataset(data_root, labels, train_paths, train=True,  jitter_frac=jitter_frac)
-    val_ds   = GCPDataset(data_root, labels, val_paths,   train=False, jitter_frac=jitter_frac)
+    train_ds = GCPDataset(
+        data_root, labels, train_paths,
+        train=True, marker_margin=marker_margin,
+    )
+    val_ds = GCPDataset(
+        data_root, labels, val_paths,
+        train=False, marker_margin=marker_margin,
+    )
     return train_ds, val_ds
 
 
 if __name__ == "__main__":
     import sys
 
-    data_root  = sys.argv[1] if len(sys.argv) > 1 else "."
+    data_root   = sys.argv[1] if len(sys.argv) > 1 else "."
     labels_path = sys.argv[2] if len(sys.argv) > 2 else os.path.join(data_root, "gcp_marks.json")
 
     train_ds, val_ds = build_train_val_datasets(data_root, labels_path)

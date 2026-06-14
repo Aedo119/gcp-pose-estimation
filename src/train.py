@@ -125,7 +125,7 @@ def main(config_path: str):
         labels_path=data_cfg["labels_path"],
         val_fraction=data_cfg.get("val_fraction", 0.15),
         seed=data_cfg.get("split_seed", 42),
-        jitter_frac=train_cfg.get("jitter_frac", 0.1),
+        marker_margin=train_cfg.get("marker_margin", 20),
     )
     print(f"Train: {len(train_ds)} samples | Val: {len(val_ds)} samples")
 

@@ -20,9 +20,11 @@ train:
   num_epochs: 30
   lr: 1.0e-4
   weight_decay: 1.0e-4
-  # jitter_frac applied to BOTH train (randomly) and val (deterministically)
-  # so val PCK is a meaningful localization metric (DECISION_LOG entry 12).
-  jitter_frac: 0.2
+  # marker_margin: min distance (native px) from marker to crop edge.
+  # Controls how far off-center the marker can appear in a training crop.
+  # Default 20px keeps the marker visible while covering the full range
+  # of positions seen during sliding-window inference (DECISION_LOG entry 14).
+  marker_margin: 20
   kp_loss_weight: 5.0
   use_class_weights: true
   num_workers: 2
@@ -33,12 +35,10 @@ train:
 inference:
   checkpoint_path: "/content/checkpoints/best_model.pt"
   output_path: "/content/predictions.json"
-  batch_size: 32
+  batch_size: 64
   num_workers: 2
-  # Sliding-window stride in native pixels.
-  # 300 = 50% overlap (recommended, more accurate).
-  # 600 = non-overlapping (faster, less accurate).
-  window_stride: 300
-  # Remap "L-Shape" -> "L-Shaped" to match assignment spec example string.
-  # Leave false to stay consistent with dataset label strings.
+  # Fine stride (150px) gives ~530 windows per 4096x2730 image — ensures
+  # at least one window has the marker well within frame (DECISION_LOG entry 14).
+  # Increase to 300 or 600 for faster (less accurate) inference.
+  window_stride: 150
   remap_lshape_to_lshaped: false

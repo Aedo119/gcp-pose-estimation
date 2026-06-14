@@ -1,38 +1,20 @@
 """
 Inference script: runs the trained model on the (unlabeled) test_dataset and
-produces predictions.json in the same format as the training labels:
+produces predictions.json in the same format as the training labels.
 
-    {
-        "project1/survey1/2/DJI_0431.JPG": {
-            "mark": {"x": 1024.5, "y": 850.2},
-            "verified_shape": "L-Shape"
-        },
-        ...
-    }
+Sliding-window approach (DECISION_LOG.md entries 13, 14):
+  - Tile each test image with CROP_SIZE x CROP_SIZE windows at the given stride.
+  - Resize each window to MODEL_INPUT_SIZE and run the model.
+  - Score each window by classification confidence ONLY (no centrality term).
+    Since the model is now trained with random marker placement (not centered),
+    it can detect markers at any position within a window — the centrality
+    assumption (marker should be near window center) no longer holds, and
+    including it would penalize valid detections (entry 14).
+  - The highest-confidence window per image provides the final prediction.
 
-IMPORTANT — train/inference scale mismatch:
-The model is trained ONLY on 600x600 crops (resized to 224x224) centered on
-a marker (DECISION_LOG.md entry 9). Resizing a full ~4096x2730 test image
-directly to 224x224 would shrink the marker to a few pixels — far outside
-the training distribution — and produce unreliable results.
-
-This script uses a sliding-window approach:
-  1. Slide a CROP_SIZE x CROP_SIZE (600x600) window across the full test
-     image with configurable stride (default 300, i.e. 50% overlap).
-  2. Resize each window to 224x224 and run the model in batches.
-  3. Score each window by BOTH classification confidence AND keypoint
-     centrality (how close the predicted keypoint is to the window center).
-     The model was trained on marker-centered crops, so a window genuinely
-     containing the marker should predict a keypoint near (0.5, 0.5) AND
-     output high classification confidence. Background windows fail at least
-     one of these criteria.
-  4. The highest-scoring window per image provides the final prediction.
-
-Stride defaults to 300 (50% overlap) for a good accuracy/speed trade-off.
-Set `inference.window_stride: 600` in config.yaml for non-overlapping
-(faster, less accurate).
-
-Edge windows are auto-padded by PIL (DECISION_LOG.md entry 11).
+Stride defaults to 150px (fine grid) for good spatial coverage. A 4096x2730
+image at stride=150 gives ~(28*19)=532 windows — each forward pass is fast,
+so this is practical on GPU.
 
 Usage:
     python -m src.inference --config configs/config.yaml
@@ -65,7 +47,7 @@ IMG_EXTENSIONS = (".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG")
 
 def find_test_images(test_root: str):
     """Recursively find all image files under test_root, returning paths
-    relative to test_root (matching gcp_marks.json format)."""
+    relative to test_root (matching gcp_marks.json path format)."""
     rel_paths = []
     for dirpath, _dirnames, filenames in os.walk(test_root):
         for fname in filenames:
@@ -78,9 +60,7 @@ def find_test_images(test_root: str):
 
 def compute_window_centers(w: int, h: int, crop_size: int, stride: int):
     """Return (cx, cy) centers tiling the image at the given stride.
-
-    The last window in each row/column is shifted inward to ensure full
-    image coverage without a partial edge strip.
+    Last window in each row/col is shifted inward for full image coverage.
     """
     half = crop_size // 2
     centers_x = list(range(half, max(w - half, half) + 1, stride)) or [w // 2]
@@ -99,7 +79,7 @@ class SlidingWindowDataset(Dataset):
 
     def __init__(self, test_root: str, rel_paths,
                  crop_size: int = CROP_SIZE,
-                 stride: int = CROP_SIZE // 2,
+                 stride: int = 150,
                  model_input_size: int = MODEL_INPUT_SIZE):
         self.test_root = test_root
         self.crop_size = crop_size
@@ -113,6 +93,7 @@ class SlidingWindowDataset(Dataset):
             std=[0.229, 0.224, 0.225],
         )
 
+        # Precompute all (rel_path, cx, cy) window tuples
         self.windows = []
         self._image_sizes = {}
         for rel_path in rel_paths:
@@ -132,7 +113,7 @@ class SlidingWindowDataset(Dataset):
 
         img = Image.open(full_path).convert("RGB")
         left, top, right, bottom = get_crop_box(cx, cy, self.crop_half)
-        crop = img.crop((left, top, right, bottom))
+        crop = img.crop((left, top, right, bottom))  # PIL auto-pads OOB
         crop = crop.resize((self.model_input_size, self.model_input_size), Image.BILINEAR)
 
         img_tensor = T.functional.to_tensor(crop)
@@ -153,10 +134,10 @@ def main(config_path: str, test_root: str = None, output_path: str = None,
     inf_cfg  = config.get("inference", {})
     data_cfg = config.get("data", {})
 
-    test_root        = test_root        or data_cfg.get("test_data_root")
-    output_path      = output_path      or inf_cfg.get("output_path", "predictions.json")
-    checkpoint_path  = checkpoint_path  or inf_cfg["checkpoint_path"]
-    stride           = inf_cfg.get("window_stride", CROP_SIZE // 2)
+    test_root       = test_root       or data_cfg.get("test_data_root")
+    output_path     = output_path     or inf_cfg.get("output_path", "predictions.json")
+    checkpoint_path = checkpoint_path or inf_cfg["checkpoint_path"]
+    stride          = inf_cfg.get("window_stride", 150)
 
     device = get_device()
     print(f"Using device: {device}")
@@ -176,18 +157,18 @@ def main(config_path: str, test_root: str = None, output_path: str = None,
 
     sw_ds = SlidingWindowDataset(test_root, rel_paths, stride=stride)
     print(f"{len(sw_ds)} total windows "
-          f"(~{len(sw_ds)/max(len(rel_paths),1):.1f}/image, stride={stride})")
+          f"(~{len(sw_ds)/max(len(rel_paths),1):.0f}/image, stride={stride})")
 
     sw_loader = DataLoader(
         sw_ds,
-        batch_size=inf_cfg.get("batch_size", 32),
+        batch_size=inf_cfg.get("batch_size", 64),
         shuffle=False,
         num_workers=inf_cfg.get("num_workers", 2),
     )
 
     remap = inf_cfg.get("remap_lshape_to_lshaped", False)
 
-    # best[path] = (score, native_x, native_y, shape_idx)
+    # best[path] = (confidence, native_x, native_y, shape_idx)
     best = {}
 
     with torch.no_grad():
@@ -196,18 +177,14 @@ def main(config_path: str, test_root: str = None, output_path: str = None,
             pred_kp, pred_logits = model(img_batch)
 
             probs = F.softmax(pred_logits, dim=1)
+            # Score by classification confidence only.
+            # No centrality term: model is trained with random marker
+            # placement so it can detect markers anywhere in the window
+            # (DECISION_LOG entry 14).
             confidence, shape_idx = probs.max(dim=1)
 
-            # Keypoint centrality: model was trained on marker-centered crops,
-            # so a window genuinely containing the marker should predict kp
-            # near (0.5, 0.5). Distance from center in [0, ~0.7]; invert to
-            # [0, 1] score. Combined with confidence, background windows that
-            # happen to be confident but off-center get penalized.
-            kp_dist = torch.norm(pred_kp - 0.5, dim=1).clamp(0, 1)
-            centrality = 1.0 - kp_dist
-            combined_score = confidence.cpu() * centrality.cpu()
-
-            pred_kp    = pred_kp.cpu()
+            pred_kp   = pred_kp.cpu()
+            confidence = confidence.cpu()
             shape_idx  = shape_idx.cpu()
 
             paths      = meta_batch["path"]
@@ -215,9 +192,9 @@ def main(config_path: str, test_root: str = None, output_path: str = None,
             crop_tops  = meta_batch["crop_top"]
 
             for i in range(len(paths)):
-                path  = paths[i]
-                left  = int(crop_lefts[i])
-                top   = int(crop_tops[i])
+                path = paths[i]
+                left = int(crop_lefts[i])
+                top  = int(crop_tops[i])
 
                 mx, my   = pred_kp[i].tolist()
                 mx_px    = mx * MODEL_INPUT_SIZE
@@ -226,11 +203,11 @@ def main(config_path: str, test_root: str = None, output_path: str = None,
                     mx_px, my_px, left, top, sw_ds.resize_scale
                 )
 
-                score = combined_score[i].item()
-                idx   = shape_idx[i].item()
+                conf = confidence[i].item()
+                idx  = shape_idx[i].item()
 
-                if path not in best or score > best[path][0]:
-                    best[path] = (score, native_x, native_y, idx)
+                if path not in best or conf > best[path][0]:
+                    best[path] = (conf, native_x, native_y, idx)
 
     predictions = {}
     for path, (_, native_x, native_y, s_idx) in best.items():
