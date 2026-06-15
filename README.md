@@ -26,7 +26,28 @@ This design is parameter-efficient, avoids duplicate feature extraction, and is 
 - Marker shape classes are imbalanced, so classification uses class-balanced weights.
 - Multiple correlated images share the same marker group, so validation is split at the group level to avoid leakage.
 - Regression targets are normalized to stabilize scale and balance them with classification loss.
+## How to run the project
+- Install dependencies
+ `pip install -r requirements.txt`
+- Training
 
+Training is executed through the provided notebook.
+
+Open the training notebook:
+
+`notebooks/02_prediction.ipynb`
+
+Then run the training cells sequentially after setting the configuration:
+- Inference
+
+Inference is also executed through the notebook.
+
+Run the inference cells after training completes.
+This will generate:
+
+` predictions.json`
+
+The notebook-based workflow ensures reproducibility across Colab and local environments without requiring shell scripts.
 ## Key implementation notes
 
 - `src/model.py` defines the shared backbone and dual-head architecture.
