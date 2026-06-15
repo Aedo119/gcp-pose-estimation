@@ -32,10 +32,6 @@ from .model import build_model
 from .utils import IDX_TO_SHAPE, denormalize_target
 
 
-def get_device() -> torch.device:
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
 def load_config(path: str) -> dict:
     with open(path) as f:
         return yaml.safe_load(f)
@@ -77,9 +73,9 @@ def run_epoch(model, loader, criterion, device, optimizer=None, model_input_size
     context = torch.enable_grad() if train_mode else torch.no_grad()
     with context:
         for img, kp, shape_label, _meta in loader:
-            img = img.to(device)
-            kp = kp.to(device)
-            shape_label = shape_label.to(device)
+            img = img.to(device, non_blocking=True)
+            kp = kp.to(device, non_blocking=True)
+            shape_label = shape_label.to(device, non_blocking=True)
 
             pred_kp, pred_logits = model(img)
             loss, loss_dict = criterion(pred_kp, pred_logits, kp, shape_label)
@@ -114,7 +110,7 @@ def run_epoch(model, loader, criterion, device, optimizer=None, model_input_size
 
 def main(config_path: str):
     config = load_config(config_path)
-    device = get_device()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
     data_cfg = config["data"]
@@ -129,13 +125,22 @@ def main(config_path: str):
     )
     print(f"Train: {len(train_ds)} samples | Val: {len(val_ds)} samples")
 
+    use_cuda = torch.cuda.is_available()
+
     train_loader = DataLoader(
-        train_ds, batch_size=train_cfg["batch_size"], shuffle=True,
-        num_workers=train_cfg.get("num_workers", 2), pin_memory=True,
+        train_ds,
+        batch_size=train_cfg["batch_size"],
+        shuffle=True,
+        num_workers=train_cfg.get("num_workers", 2) if use_cuda else 0,
+        pin_memory=use_cuda,
     )
+
     val_loader = DataLoader(
-        val_ds, batch_size=train_cfg["batch_size"], shuffle=False,
-        num_workers=train_cfg.get("num_workers", 2), pin_memory=True,
+        val_ds,
+        batch_size=train_cfg["batch_size"],
+        shuffle=False,
+        num_workers=train_cfg.get("num_workers", 2) if use_cuda else 0,
+        pin_memory=use_cuda,
     )
 
     model = build_model(config).to(device)

@@ -122,9 +122,6 @@ class SlidingWindowDataset(Dataset):
         return img_tensor, {"path": rel_path, "crop_left": left, "crop_top": top}
 
 
-def get_device() -> torch.device:
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
 
 def main(config_path: str, test_root: str = None, output_path: str = None,
          checkpoint_path: str = None):
@@ -139,8 +136,8 @@ def main(config_path: str, test_root: str = None, output_path: str = None,
     checkpoint_path = checkpoint_path or inf_cfg["checkpoint_path"]
     stride          = inf_cfg.get("window_stride", 150)
 
-    device = get_device()
-    print(f"Using device: {device}")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Using device:", device)
 
     # --- Load model ---
     checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -159,11 +156,14 @@ def main(config_path: str, test_root: str = None, output_path: str = None,
     print(f"{len(sw_ds)} total windows "
           f"(~{len(sw_ds)/max(len(rel_paths),1):.0f}/image, stride={stride})")
 
+    use_cuda = torch.cuda.is_available()
+
     sw_loader = DataLoader(
         sw_ds,
-        batch_size=inf_cfg.get("batch_size", 64),
+        batch_size=inf_cfg.get("batch_size", 64) if use_cuda else 16,
         shuffle=False,
-        num_workers=inf_cfg.get("num_workers", 2),
+        num_workers=inf_cfg.get("num_workers", 2) if use_cuda else 0,
+        pin_memory=use_cuda,
     )
 
     remap = inf_cfg.get("remap_lshape_to_lshaped", False)
@@ -173,7 +173,7 @@ def main(config_path: str, test_root: str = None, output_path: str = None,
 
     with torch.no_grad():
         for img_batch, meta_batch in sw_loader:
-            img_batch = img_batch.to(device)
+            img_batch = img_batch.to(device, non_blocking=True)
             pred_kp, pred_logits = model(img_batch)
 
             probs = F.softmax(pred_logits, dim=1)
